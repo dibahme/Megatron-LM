@@ -893,6 +893,7 @@ def _load_base_checkpoint(
 
     # Determine the type of the checkpoint
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
+    print("+++++++++++++:",checkpoint_name)
     is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
     if not rank0:
         dist_infix = "distributed " if is_dist_ckpt else ""

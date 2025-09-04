@@ -440,6 +440,7 @@ def get_batch_on_this_tp_rank(data_iterator):
            'tokens': data["tokens"].cuda(non_blocking = True),
            'labels': data["labels"].cuda(non_blocking = True),
            'loss_mask': data["loss_mask"].cuda(non_blocking = True),
+           'report_loss_mask': data["report_loss_mask"].cuda(non_blocking = True) if "report_loss_mask" in data else None,
            'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
            'position_ids': data["position_ids"].cuda(non_blocking = True)
        }
@@ -462,6 +463,7 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(batch['attention_mask'])
 
     else:
+
 
        tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
        labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())

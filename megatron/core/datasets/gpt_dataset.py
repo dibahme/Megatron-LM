@@ -8,7 +8,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy
 import torch
-
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -22,6 +21,8 @@ logger = logging.getLogger(__name__)
 _PAD_TOKEN_ID = -1
 _GOLDFISH_TOKEN_ID = -2
 _HASH_TABLE_SIZE = 1_000_003
+_BEGIN_OF_CONTEXT_TOKEN_ID = 61
+_END_OF_CONTEXT_TOKEN_ID = 62
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
@@ -44,6 +45,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     goldfish_h: int = None
     """Context width for hashing, everytime the same sequence of h tokens appears, the (h+1)th token is ingored"""
+    
+    masking_meta_data: bool = True
+    """Option to mask out meta data tokens for loss calculation"""
+
+    meta_data_appending: bool = False
+    """Applies masking to the metadata only for loss monitoring and not for optimization"""
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
@@ -129,6 +136,10 @@ class GPTDataset(MegatronDataset):
             self._goldfish_h = self.config.goldfish_h
             self._goldfish_token_id = _GOLDFISH_TOKEN_ID
             self._goldfish_hash_table = None
+
+        if self.config.masking_meta_data:
+            self._boc_token_id = _BEGIN_OF_CONTEXT_TOKEN_ID
+            self._eoc_token_id = _END_OF_CONTEXT_TOKEN_ID
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -245,25 +256,40 @@ class GPTDataset(MegatronDataset):
 
             loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
 
+        report_loss_mask = None
+        if self.config.masking_meta_data:
+            meta_masks = apply_meta_data_mask(
+                labels,
+                self._boc_token_id,
+                self._eoc_token_id,
+            )
+
+            if self.config.meta_data_appending:
+                report_loss_mask = loss_mask.clone()
+                report_loss_mask[meta_masks == self._boc_token_id] = 0.0
+            else:
+                loss_mask[meta_masks == self._boc_token_id] = 0.0
+
+
+
         # Batch padding sequence so we mask the loss
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        return_dict = {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
+
+        if report_loss_mask is not None:
+            return_dict["report_loss_mask"] = report_loss_mask
+
         if self.config.create_attention_mask:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "attention_mask": attention_mask,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
-        else:
-            return {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "position_ids": position_ids,
-            }
+            return_dict["attention_mask"] = attention_mask
+
+        return return_dict
 
     def _query_document_sample_shuffle_indices(
         self, idx: int
@@ -766,6 +792,49 @@ def apply_goldfish(
     masked_labels[goldfish_context_width-1:][dropped_token_indices] = goldfish_token_id
 
     return masked_labels
+
+
+def apply_meta_data_mask(
+    labels: torch.Tensor,
+    boc_token_id: int,
+    eoc_token_id: int,
+):
+    """
+    masking out meta data for loss calculation
+    """
+    masked_labels = labels.clone()
+    begin_indices = [i for i, token in enumerate(labels) if token == boc_token_id]
+    end_indices = [i for i, token in enumerate(labels) if token == eoc_token_id]
+
+    b = 0
+    e = 0
+
+    if len(begin_indices) > 0 and len(end_indices) > 0:
+        while b < len(begin_indices) and e < len(end_indices):
+            if begin_indices[b] < end_indices[e]:
+                start = begin_indices[b]
+                end = end_indices[e] + 1
+                masked_labels[start:end] = torch.tensor([boc_token_id] * (end - start), dtype=masked_labels.dtype)
+                b += 1
+                e += 1
+            elif begin_indices[b] > end_indices[e]:
+                end = end_indices[e] + 1
+                masked_labels[:end] = torch.tensor([boc_token_id] * end, dtype=masked_labels.dtype)
+                e += 1
+        if b < len(begin_indices):
+            start = begin_indices[b]
+            masked_labels[start:] = torch.tensor([boc_token_id] * (len(masked_labels) - start), dtype=masked_labels.dtype)
+    else:
+        if len(begin_indices) > 0:
+            start = begin_indices[0]
+            masked_labels[start:] = torch.tensor([boc_token_id] * (len(masked_labels) - start), dtype=masked_labels.dtype)
+        if len(end_indices) > 0:
+            end = end_indices[0] + 1
+            masked_labels[:end] = torch.tensor([boc_token_id] * end, dtype=masked_labels.dtype)
+
+    return masked_labels
+
+
 
 
 class MockGPTLowLevelDataset:
